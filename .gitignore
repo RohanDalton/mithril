@@ -1,0 +1,13 @@
+*.pyc
+__pycache__/**
+
+coverage
+docs/build
+
+.idea
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+.DS_STORE

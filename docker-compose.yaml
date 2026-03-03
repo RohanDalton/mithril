@@ -1,0 +1,35 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mithril-postgres
+    environment:
+      POSTGRES_DB: mithril
+      POSTGRES_USER: mithril
+      POSTGRES_PASSWORD: mithril
+    ports:
+      - "5532:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U mithril -d mithril" ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+    volumes:
+      - mithril-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: mithril-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  mithril-postgres:

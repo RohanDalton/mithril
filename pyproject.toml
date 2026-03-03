@@ -1,0 +1,84 @@
+[project]
+authors = [{name = "Rohan B. Dalton", email = "rohan@rohandalton.io"}]
+dependencies = [
+    "sqlalchemy>=2.0,<3",
+    "structlog>=24.0.0,<26",
+    "opentelemetry-api>=1.20.0,<2",
+]
+name = "mithril"
+requires-python = ">= 3.9"
+version = "0.1.0"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.coverage.html]
+directory = "coverage/html"
+
+[tool.coverage.report]
+exclude_lines = [
+    "if __name__ == __main__:",
+]
+
+[tool.coverage.run]
+branch = true
+data_file = "coverage/.coverage"
+relative_files = true
+source = ["mithril"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+conda-pypi-map = { conda-forge = "conda_pypi_map.json" }
+
+[tool.pixi.pypi-dependencies]
+mithril = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+
+[tool.pixi.feature.dev.dependencies]
+pytest = "*"
+pytest-cov = "*"
+mypy = "*"
+ruff = "*"
+pytest-asyncio = "*"
+pytest-sugar = ">=1.1.1,<2"
+
+[tool.pixi.feature.docs.dependencies]
+sphinx = "*"
+
+[tool.pixi.dependencies]
+redis-py = ">=7.1.1,<8"
+sqlalchemy = ">=2,<3"
+structlog = ">=25.5.0,<26"
+opentelemetry-api = ">=1.39.1,<2"
+psycopg2 = ">=2.9.11,<3"
+asyncpg = ">=0.31.0,<0.32"
+aiosqlite = ">=0.22.1,<0.23"
+
+[tool.pixi.environments]
+dev = ["dev", "docs"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "--cov=mithril --cov-branch --cov-report=term-missing --cov-report=html:coverage"
+
+[tool.ruff]
+line-length = 95
+indent-width = 4
+target-version = "py39"
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "double"
+skip-magic-trailing-comma = false
+
+[tool.ruff.lint]
+select = ["B", "C4", "FURB", "I", "PERF", "PL", "S", "SIM", "UP"]
+
+[tool.ruff.lint.isort]
+case-sensitive = true
