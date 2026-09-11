@@ -154,9 +154,8 @@ def test_context_surfaces_ownership_loss():
     """
     backend = FakeBackend()
     lock = Lock("lost", backend=backend)
-    with pytest.raises(LockExpiredError):
-        with lock:
-            lock._on_renewal_failed()
+    with pytest.raises(LockExpiredError), lock:
+        lock._on_renewal_failed()
     assert backend.owner is None
 
 
@@ -167,10 +166,9 @@ def test_expired_context_preserves_body_exception():
     THEN: The original body exception is preserved
     """
     lock = Lock("lost", backend=FakeBackend())
-    with pytest.raises(KeyError):
-        with lock:
-            lock._on_renewal_failed()
-            raise KeyError("body failed")
+    with pytest.raises(KeyError), lock:
+        lock._on_renewal_failed()
+        raise KeyError("body failed")
 
 
 def test_state_and_token_notice_expiry(monkeypatch):

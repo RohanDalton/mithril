@@ -45,7 +45,7 @@ from ._retry import AsyncRetryPolicy
 
 __author__ = "Rohan B. Dalton"
 
-_ACTIVE_LOCKS: "weakref.WeakSet[AsyncLock]" = weakref.WeakSet()
+_ACTIVE_LOCKS: weakref.WeakSet[AsyncLock] = weakref.WeakSet()
 
 
 async def _release_held_locks() -> None:

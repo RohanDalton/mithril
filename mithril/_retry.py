@@ -7,7 +7,8 @@ from __future__ import annotations
 import dataclasses
 import random
 import time
-from typing import Callable, Iterator
+from collections.abc import Iterator
+from typing import Callable
 
 from ._types import validate_duration
 

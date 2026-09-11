@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from typing import Any, ClassVar, Iterable, Iterator
+from typing import Any, ClassVar
 
 from sqlalchemy import Engine, TextClause, text
 from sqlalchemy.pool import SingletonThreadPool, StaticPool

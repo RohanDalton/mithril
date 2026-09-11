@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from typing import Any, Iterator
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 

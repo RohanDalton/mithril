@@ -1,7 +1,7 @@
 import threading
 
-import redis
 import pytest
+import redis
 
 from mithril._fencing import (
     FileFencingTokenProvider,

@@ -57,8 +57,11 @@ psycopg2 = ">=2.9.11,<3"
 asyncpg = ">=0.31.0,<0.32"
 aiosqlite = ">=0.22.1,<0.23"
 
-[tool.pixi.environments]
-dev = ["dev", "docs"]
+[tool.pixi.environments.dev]
+features = ["dev", "docs"]
+
+[tool.pixi.environments.dev.dependencies]
+pre-commit = ">=4.6.2,<5"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

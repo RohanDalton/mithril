@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from redis import ConnectionPool, Redis
 from redis.backoff import NoBackoff

@@ -46,7 +46,6 @@ class FakeClient:
 
     def blpop(self, key, timeout):
         self.blpop_calls.append((key, timeout))
-        return None
 
     def get(self, _key):
         return None

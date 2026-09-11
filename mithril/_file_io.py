@@ -76,19 +76,19 @@ def unlock_file(handle) -> None:
 
 @contextmanager
 def file_mutex(path: Path):
-    with open_file(path) as handle:
-        if not lock_file(handle, blocking=True):
+    with open_file(path) as fh:
+        if not lock_file(fh, blocking=True):
             raise BackendError("Could not acquire file metadata mutex")
         try:
             yield
         finally:
-            unlock_file(handle)
+            unlock_file(fh)
 
 
 def read_file(path: Path) -> str | None:
     try:
-        with open_file(path, create=False) as handle:
-            return handle.read()
+        with open_file(path, create=False) as fh:
+            return fh.read()
     except FileNotFoundError:
         return None
 
@@ -101,10 +101,10 @@ def replace_file(path: Path, data: str) -> None:
         raise ValueError("lock path must not be a symlink")
     fd, temporary = tempfile.mkstemp(prefix=".mithril-", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(temporary, path)
         if os.name != "nt":
             directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))

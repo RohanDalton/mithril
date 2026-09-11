@@ -42,7 +42,6 @@ class FakeClient:
 
     def get(self, key):
         self.get_calls.append(key)
-        return None
 
     def exists(self, key):
         self.exists_calls.append(key)

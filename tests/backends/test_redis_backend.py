@@ -3,8 +3,8 @@ import time
 import pytest
 import redis
 
-from mithril.backends._redis import RedisBackend
 from mithril._types import LockMode, Result
+from mithril.backends._redis import RedisBackend
 
 __author__ = "Rohan B. Dalton"
 

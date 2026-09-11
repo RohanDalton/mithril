@@ -24,11 +24,10 @@ def pg_engine():
     engine = create_engine(_PG_URL)
     with engine.connect() as conn:
         PostgresBackend(conn)
-    with engine.connect() as conn:
-        with conn.begin():
-            conn.execute(text("DELETE FROM mithril_locks"))
-            conn.execute(text("DELETE FROM mithril_readers"))
-            conn.execute(text("DELETE FROM mithril_fencing"))
+    with engine.connect() as conn, conn.begin():
+        conn.execute(text("DELETE FROM mithril_locks"))
+        conn.execute(text("DELETE FROM mithril_readers"))
+        conn.execute(text("DELETE FROM mithril_fencing"))
     yield engine
     engine.dispose()
 
@@ -258,11 +257,10 @@ def test_concurrent_writer_and_reader_cannot_both_succeed(pg_engine) -> None:
     iterations = 50
 
     for idx in range(iterations):
-        with pg_engine.connect() as cleanup:
-            with cleanup.begin():
-                cleanup.execute(text("DELETE FROM mithril_locks"))
-                cleanup.execute(text("DELETE FROM mithril_readers"))
-                cleanup.execute(text("DELETE FROM mithril_fencing"))
+        with pg_engine.connect() as cleanup, cleanup.begin():
+            cleanup.execute(text("DELETE FROM mithril_locks"))
+            cleanup.execute(text("DELETE FROM mithril_readers"))
+            cleanup.execute(text("DELETE FROM mithril_fencing"))
 
         writer_conn = pg_engine.connect()
         reader_conn = pg_engine.connect()

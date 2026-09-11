@@ -46,7 +46,7 @@ from .exceptions import (
 
 __author__ = "Rohan B. Dalton"
 
-_ACTIVE_LOCKS: "weakref.WeakSet[Lock]" = weakref.WeakSet()
+_ACTIVE_LOCKS: weakref.WeakSet[Lock] = weakref.WeakSet()
 
 
 def _release_held_locks() -> None:

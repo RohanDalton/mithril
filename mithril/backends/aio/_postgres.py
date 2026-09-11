@@ -4,7 +4,7 @@ Async Postgres backend for Mithril.
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError

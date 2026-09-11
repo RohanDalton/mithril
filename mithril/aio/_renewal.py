@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 import random
 import weakref
-from typing import Awaitable, Callable
+from collections.abc import Awaitable
+from typing import Callable
 
 import structlog
 

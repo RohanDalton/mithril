@@ -25,11 +25,10 @@ async def async_pg_engine():
     async with engine.connect() as conn:
         backend = AsyncPostgresBackend(conn)
         await backend.initialize()
-    async with engine.connect() as conn:
-        async with conn.begin():
-            await conn.execute(text("DELETE FROM mithril_locks"))
-            await conn.execute(text("DELETE FROM mithril_readers"))
-            await conn.execute(text("DELETE FROM mithril_fencing"))
+    async with engine.connect() as conn, conn.begin():
+        await conn.execute(text("DELETE FROM mithril_locks"))
+        await conn.execute(text("DELETE FROM mithril_readers"))
+        await conn.execute(text("DELETE FROM mithril_fencing"))
     yield engine
     await engine.dispose()
 

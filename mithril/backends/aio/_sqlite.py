@@ -4,7 +4,7 @@ Async SQLite backend for Mithril.
 
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
@@ -103,14 +103,11 @@ class AsyncSQLiteBackend(AsyncDatabaseBackend):
                 result = await transaction.execute(dml_statement, params)
                 if result.rowcount:
                     return Result.SUCCESS
+            select = statements[2]
+            if await self._fetchone(statement=select, params=params, transaction=transaction):
+                return Result.WRONG_OWNER
             else:
-                select = statements[2]
-                if await self._fetchone(
-                    statement=select, params=params, transaction=transaction
-                ):
-                    return Result.WRONG_OWNER
-                else:
-                    return Result.NOT_FOUND
+                return Result.NOT_FOUND
 
     async def _renew_exclusive(
         self, lock_name: str, owner_id: str, ttl_seconds: float

@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable
+from typing import Callable
 
 from .._retry import RetryAttempt
 from .._types import validate_duration
