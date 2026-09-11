@@ -4,19 +4,29 @@ Postgres backend for Mithril.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import Any, Iterable, Iterator
-
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 
-from .._types import LockMode, Result
-from ..exceptions import ConfigurationError
+from .._retry import RetryPolicy
+from .._types import Result
+from ..exceptions import BackendTimeoutError
 from ._database import DatabaseBackend
 
 __author__ = "Rohan B. Dalton"
 
-_SERIALIZATION_FAILURE = "40001"
+
+def _is_transaction_conflict(exc: BaseException) -> bool:
+    """
+    Recognize rolled-back conflicts, including asyncpg commit-error wrappers.
+    """
+    while exc is not None:
+        if (getattr(exc, "sqlstate", None) or getattr(exc, "pgcode", None)) in {
+            "40001",
+            "40P01",
+        }:
+            return True
+        exc = getattr(exc, "orig", None) or exc.__cause__
+    return False
 
 
 class PostgresQueries:
@@ -40,7 +50,7 @@ WITH token AS (
 ),
 upsert AS (
     INSERT INTO mithril_locks(name, owner, fencing_token, epoch, acquired_at, expire_at)
-    SELECT :lock_name, :owner_id, token.token, :epoch, NOW(),
+    SELECT :lock_name, :owner_id, token.token, token.token, NOW(),
            NOW() + (:ttl_seconds || ' seconds')::interval
     FROM token
     WHERE NOT EXISTS (
@@ -91,7 +101,7 @@ reader_upsert AS (
         expire_at = NOW() + (:ttl_seconds || ' seconds')::interval
     RETURNING 1
 )
-SELECT token.token, :epoch FROM token WHERE EXISTS (SELECT 1 FROM reader_upsert)
+SELECT token.token, token.token FROM token WHERE EXISTS (SELECT 1 FROM reader_upsert)
 """)
     IS_LOCKED = [
         text("SELECT 1 FROM mithril_locks WHERE name = :lock_name AND expire_at > NOW()"),
@@ -212,10 +222,26 @@ class PostgresBackend(DatabaseBackend):
     """
 
     _QUERIES = PostgresQueries
+    _isolation_level = "SERIALIZABLE"
 
-    def __init__(self, connection: Any) -> None:
-        super().__init__(connection=connection)
-        self._connection.execution_options(isolation_level="SERIALIZABLE")
+    def _fetchone(self, statement, params, transaction=None):
+        if transaction is not None or statement in (
+            self._QUERIES.ACQUIRE_EXCLUSIVE,
+            self._QUERIES.ACQUIRE_SHARED,
+        ):
+            return super()._fetchone(statement, params, transaction)
+        retry = RetryPolicy(timeout=1, base_delay=0.001, max_delay=0.025, jitter=0.001)
+        failure = None
+        for _ in retry.attempts():
+            try:
+                return super()._fetchone(statement, params)
+            except DBAPIError as exc:
+                if not _is_transaction_conflict(exc):
+                    raise
+                failure = exc
+        raise BackendTimeoutError(
+            "Postgres transaction conflicts exceeded the retry budget"
+        ) from failure
 
     def _renew(self, statement, lock_name: str, owner_id: str, ttl_seconds: float) -> Result:
         params = ({"lock_name": lock_name, "owner_id": owner_id, "ttl_seconds": ttl_seconds},)
@@ -256,8 +282,8 @@ class PostgresBackend(DatabaseBackend):
                 return int(row[0]), int(row[1])
             else:
                 return None
-        except OperationalError as exc:
-            if self._is_serialization_failure(exc):
+        except DBAPIError as exc:
+            if _is_transaction_conflict(exc):
                 return None
             raise
 
@@ -300,17 +326,6 @@ class PostgresBackend(DatabaseBackend):
             return Result(int(row[0]))
         else:
             return Result.NOT_FOUND
-
-    @staticmethod
-    def _is_serialization_failure(exc: OperationalError) -> bool:
-        """
-        Return True if the exception is a Postgres serialization failure.
-        """
-        if orig := exc.orig:
-            if code := getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None):
-                return code == _SERIALIZATION_FAILURE
-
-        return False
 
 
 if __name__ == "__main__":

@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
+from mithril._types import LockMode, LockState, LockToken, Result
 from mithril.aio.lock import AsyncLock
-from mithril._types import LockMode, LockState, LockToken
 from mithril.exceptions import (
     AlreadyAcquiredError,
     ConfigurationError,
@@ -43,8 +43,6 @@ class AsyncFakeBackend:
         return self.token, self.epoch
 
     async def release(self, key: str, owner_id: str, mode=LockMode.EXCLUSIVE):
-        from mithril._types import Result
-
         self.release_calls += 1
         if self.owner is None:
             return Result.NOT_FOUND
@@ -56,8 +54,6 @@ class AsyncFakeBackend:
     async def renew(
         self, key: str, owner_id: str, ttl_seconds: float, mode=LockMode.EXCLUSIVE
     ):
-        from mithril._types import Result
-
         self.renew_calls += 1
         if self.owner != owner_id:
             return Result.WRONG_OWNER

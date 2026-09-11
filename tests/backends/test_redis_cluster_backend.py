@@ -1,5 +1,10 @@
-import pytest
+from contextlib import contextmanager
 
+import pytest
+from redis.exceptions import MovedError
+
+from mithril._types import Result
+from mithril.backends import _redis_scripts
 from mithril.backends._redis_cluster import RedisClusterBackend
 from mithril.exceptions import ConfigurationError
 
@@ -11,8 +16,8 @@ class FakeScript:
         self.result = result
         self.calls = []
 
-    def __call__(self, *, keys, args):
-        self.calls.append({"keys": keys, "args": args})
+    def __call__(self, *, keys, args=None, client=None):
+        self.calls.append({"keys": keys, "args": args, "client": client})
         return self.result
 
 
@@ -25,11 +30,15 @@ class FakeClient:
         self.blpop_calls = []
 
     def register_script(self, _script):
-        if _script.strip().startswith("local acquired"):
+        if _script == _redis_scripts.ACQUIRE:
             return self.acquire_script
-        if "LPUSH" in _script:
+        if _script == _redis_scripts.RELEASE:
             return self.release_script
         return self.renew_script
+
+    @contextmanager
+    def client(self):
+        yield self
 
     def execute_command(self, *args):
         self.wait_calls.append(args)
@@ -100,6 +109,71 @@ def test_cluster_backend_uses_hash_slot_tag() -> None:
     assert keys[1].startswith("{ns:lock}:fence")
     assert keys[2].startswith("{ns:lock}:signal")
     assert keys[3].startswith("{ns:lock}:meta")
+
+
+def test_insufficient_replication_cleans_up_acquisition(monkeypatch):
+    """
+    GIVEN: A successful lease write without sufficient replica acknowledgments
+    WHEN: Safe acquisition checks WAIT
+    THEN: It releases the unconfirmed lease and reports failure
+    """
+    client = FakeClient()
+    monkeypatch.setattr(client, "execute_command", lambda *args: 0)
+    backend = RedisClusterBackend(client, safety_level="safe", wait_replicas=1)
+    assert backend.acquire("lock", "owner", 5) is None
+    assert len(client.release_script.calls) == 1
+
+
+def test_wait_and_script_share_the_pinned_connection(monkeypatch):
+    """
+    GIVEN: A pool whose dedicated client differs from the parent client
+    WHEN: Safe acquisition runs its script and WAIT
+    THEN: Both commands use the dedicated connection
+    """
+    client = FakeClient()
+    connection = FakeClient()
+
+    @contextmanager
+    def pinned_client():
+        yield connection
+
+    monkeypatch.setattr(client, "client", pinned_client)
+    backend = RedisClusterBackend(client, safety_level="safe", wait_replicas=1)
+    assert backend.acquire("lock", "owner", 5) == (1, 1)
+    assert client.acquire_script.calls[0]["client"] is connection
+    assert connection.wait_calls
+    assert client.wait_calls == []
+
+
+def test_failed_renewal_replication_releases_lease(monkeypatch):
+    """
+    GIVEN: A renewed lease whose replication cannot be confirmed
+    WHEN: Safe renewal checks WAIT
+    THEN: It fails closed and cleans up ownership
+    """
+    client = FakeClient()
+    monkeypatch.setattr(client, "execute_command", lambda *args: 0)
+    backend = RedisClusterBackend(client, safety_level="safe", wait_replicas=1)
+    assert backend.renew("lock", "owner", 5) == Result.NOT_FOUND
+    assert client.release_script.calls
+
+
+def test_redirected_acquisition_is_not_accepted(monkeypatch):
+    """
+    GIVEN: The primary redirects a pinned acquisition during slot migration
+    WHEN: Safe acquisition encounters MOVED
+    THEN: Ownership is cleaned up and acquisition is retried by the facade
+    """
+    client = FakeClient()
+    backend = RedisClusterBackend(client, safety_level="safe", wait_replicas=1)
+
+    def moved(**kwargs):
+        raise MovedError("1 127.0.0.1:7001")
+
+    monkeypatch.setattr(backend, "_acquire_script", moved)
+    assert backend.acquire("lock", "owner", 5) is None
+    assert client.release_script.calls
+    assert client.wait_calls == []
 
 
 if __name__ == "__main__":

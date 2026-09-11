@@ -5,8 +5,10 @@ Core types and protocols for Mithril locks.
 from __future__ import annotations
 
 import dataclasses
+import inspect
+import math
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from .exceptions import ConfigurationError
 
@@ -33,6 +35,7 @@ class LockState(Enum):
     """
 
     UNLOCKED = "unlocked"
+    ACQUIRING = "acquiring"
     ACQUIRED = "acquired"
     EXPIRED = "expired"
     RELEASED = "released"
@@ -57,6 +60,26 @@ class Result(Enum):
     NOT_FOUND = 2
 
 
+@dataclasses.dataclass(frozen=True)
+class AcquisitionResult:
+    """
+    Backend acquisition with a conservative monotonic validity deadline.
+    """
+
+    fencing_token: int
+    epoch: int
+    expire_at: float
+
+
+@dataclasses.dataclass(frozen=True)
+class RenewalResult:
+    """
+    Successful renewal with a backend-specific monotonic validity deadline.
+    """
+
+    expire_at: float
+
+
 class LockBackend(Protocol):
     """
     Backend interface for lock operations.
@@ -67,9 +90,9 @@ class LockBackend(Protocol):
         key: str,
         owner_id: str,
         ttl_seconds: float,
-        epoch: int,
+        epoch: int = 0,
         mode: LockMode = LockMode.EXCLUSIVE,
-    ) -> tuple[int, int] | None: ...
+    ) -> tuple[int, int] | AcquisitionResult | None: ...
 
     def release(
         self,
@@ -84,7 +107,7 @@ class LockBackend(Protocol):
         owner_id: str,
         ttl_seconds: float,
         mode: LockMode = LockMode.EXCLUSIVE,
-    ) -> Result: ...
+    ) -> Result | RenewalResult: ...
 
     def get_owner(self, key: str) -> str | None: ...
 
@@ -110,14 +133,53 @@ class LockConfig:
     debug: bool = False
 
     def __post_init__(self) -> None:
-        if self.ttl is not None and self.ttl <= 0:
-            raise ConfigurationError("ttl must be > 0 when provided")
-        if self.timeout < 0:
-            raise ConfigurationError("timeout must be >= 0")
-        if self.retry_interval <= 0:
-            raise ConfigurationError("retry_interval must be > 0")
+        if not isinstance(self.name, str) or not self.name:
+            raise ConfigurationError("name must be a nonempty string")
+        if not isinstance(self.namespace, str):
+            raise ConfigurationError("namespace must be a string")
+        if self.ttl is not None:
+            validate_duration(self.ttl, "ttl")
+        validate_duration(self.timeout, "timeout", allow_zero=True)
+        validate_duration(self.retry_interval, "retry_interval")
+        validate_duration(self.retry_jitter, "retry_jitter", allow_zero=True)
+        if not isinstance(self.mode, LockMode):
+            raise ConfigurationError("mode must be a LockMode")
+        for name in ("auto_renewal", "strict", "debug"):
+            if not isinstance(getattr(self, name), bool):
+                raise ConfigurationError(f"{name} must be a bool")
         if self.auto_renewal and self.ttl is None:
             raise ConfigurationError("auto_renewal requires ttl to be set")
+        if self.renewal_interval is not None:
+            validate_duration(self.renewal_interval, "renewal_interval")
+            if self.ttl is None or self.renewal_interval * 1.1 >= self.ttl:
+                raise ConfigurationError("renewal_interval including jitter must be < ttl")
+
+
+def validate_duration(value: float, name: str, *, allow_zero: bool = False) -> None:
+    """
+    Reject invalid, nonfinite, or negative durations before backend mutation.
+    """
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        or (value == 0 and not allow_zero)
+    ):
+        bound = ">= 0" if allow_zero else "> 0"
+        raise ConfigurationError(f"{name} must be finite and {bound}")
+
+
+def validate_backend(backend: Any, *, asynchronous: bool = False) -> None:
+    """
+    Validate the mutation interface without requiring a particular backend class.
+    """
+    for name in ("acquire", "release", "renew"):
+        if not callable(method := getattr(backend, name, None)):
+            raise ConfigurationError(f"backend must implement {name}()")
+        if inspect.iscoroutinefunction(method) != asynchronous:
+            kind = "asynchronous" if asynchronous else "synchronous"
+            raise ConfigurationError(f"backend.{name} must be {kind}")
 
 
 __all__ = [
@@ -127,6 +189,8 @@ __all__ = [
     "LockMode",
     "LockConfig",
     "Result",
+    "AcquisitionResult",
+    "RenewalResult",
 ]
 
 if __name__ == "__main__":

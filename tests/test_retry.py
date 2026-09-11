@@ -93,5 +93,33 @@ def test_wait_func_receives_remaining_time() -> None:
     assert all(wait <= 1.0 for wait in waits)
 
 
+def test_backend_time_counts_toward_retry_deadline():
+    """
+    GIVEN: An acquisition attempt consumes nearly the entire timeout
+    WHEN: The retry engine waits after that attempt
+    THEN: It uses the remaining budget after the attempt instead of stale timing
+    """
+    clock = FakeClock()
+    policy = RetryPolicy(timeout=1, base_delay=0.8, max_delay=1, jitter=0, clock=clock.now)
+    attempts = policy.attempts(wait_func=clock.wait)
+    next(attempts)
+    clock.advance(0.9)
+    assert list(attempts) == []
+    assert clock.now() == pytest.approx(1.0)
+
+
+def test_jitter_cannot_exceed_max_delay(monkeypatch):
+    """
+    GIVEN: Jitter larger than the configured maximum retry delay
+    WHEN: Backoff delays are calculated
+    THEN: Every delay still respects the maximum
+    """
+    clock = FakeClock()
+    monkeypatch.setattr(random, "uniform", lambda *args: 10)
+    policy = RetryPolicy(timeout=3, base_delay=0.5, max_delay=1, jitter=10, clock=clock.now)
+    attempts = list(policy.attempts(wait_func=clock.wait))
+    assert all(attempt.delay <= 1 for attempt in attempts)
+
+
 if __name__ == "__main__":
     pass

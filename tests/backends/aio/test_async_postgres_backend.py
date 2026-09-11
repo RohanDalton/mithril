@@ -6,6 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from mithril._types import LockMode, Result
+from mithril.aio import AsyncLock
 from mithril.backends.aio._postgres import AsyncPostgresBackend
 
 __author__ = "Rohan B. Dalton"
@@ -302,6 +303,23 @@ async def test_failed_shared_acquire_does_not_increment_fencing_token(
     token_after_reacquire = result2[0]
 
     assert token_after_reacquire == token_after_acquire + 1
+
+
+async def test_shared_backend_has_independent_transactions(backend):
+    """
+    GIVEN: One async Postgres backend shared by concurrent tasks
+    WHEN: Independent locks are acquired and released
+    THEN: Connections are isolated and epochs persist between facade instances
+    """
+
+    async def use_lock(number):
+        name = f"concurrent-{number}"
+        async with AsyncLock(name, backend=backend, ttl=5) as first:
+            assert first.epoch == 1
+        async with AsyncLock(name, backend=backend, ttl=5) as second:
+            assert second.epoch > first.epoch
+
+    await asyncio.gather(*(use_lock(number) for number in range(20)))
 
 
 if __name__ == "__main__":

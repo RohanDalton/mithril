@@ -2,9 +2,8 @@ import time
 
 import pytest
 
-from mithril.lock import Lock
-from mithril._types import LockMode, LockState, LockToken
 from mithril._observability import LockHooks
+from mithril._types import LockMode, LockState, LockToken, Result
 from mithril.exceptions import (
     AlreadyAcquiredError,
     ConfigurationError,
@@ -13,6 +12,7 @@ from mithril.exceptions import (
     NotAcquiredError,
     RenewalFailedError,
 )
+from mithril.lock import Lock
 
 __author__ = "Rohan B. Dalton"
 
@@ -44,8 +44,6 @@ class FakeBackend:
         return self.token, self.epoch
 
     def release(self, key: str, owner_id: str, mode=LockMode.EXCLUSIVE):
-        from mithril._types import Result
-
         self.release_calls += 1
         if self.owner is None:
             return Result.NOT_FOUND
@@ -55,8 +53,6 @@ class FakeBackend:
         return Result.SUCCESS
 
     def renew(self, key: str, owner_id: str, ttl_seconds: float, mode=LockMode.EXCLUSIVE):
-        from mithril._types import Result
-
         self.renew_calls += 1
         if self.owner != owner_id:
             return Result.WRONG_OWNER

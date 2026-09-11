@@ -112,6 +112,24 @@ def record_event(event: LockEvent, hooks: LockHooks | None = None) -> None:
     Invoke hooks and record OpenTelemetry metrics.
     """
 
+    try:
+        _record_event(event, hooks)
+    except Exception:
+        log_safely(_LOGGER, "exception", "lock_observability_failed", lock_event=event.event)
+
+
+def log_safely(logger, level: str, event: str, *args, **kwargs) -> None:
+    """
+    Logging failures must never interrupt ownership transitions or cleanup.
+    """
+    try:
+        getattr(logger, level)(event, *args, **kwargs)
+    except Exception:
+        # Retrying through the same broken logging pipeline would fail again.
+        pass
+
+
+def _record_event(event: LockEvent, hooks: LockHooks | None = None) -> None:
     hooks = hooks or _HOOKS
     if event.event == "acquire":
         if hooks.on_acquire is not None:

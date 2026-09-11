@@ -1,9 +1,11 @@
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import create_engine, text
 
+from mithril import Lock, LockState
 from mithril._types import LockMode, Result
 from mithril.backends._postgres import PostgresBackend
 
@@ -226,13 +228,15 @@ def test_isolation_level_is_serializable(pg_engine) -> None:
     """
     GIVEN: A PostgresBackend
     WHEN: The transaction isolation level is queried
-    THEN: It is set to serializable
+    THEN: Private transactions are serializable without modifying the caller
     """
     conn = pg_engine.connect()
-    PostgresBackend(conn)
-    with conn.begin():
-        result = conn.execute(text("SHOW transaction_isolation"))
+    original = conn.get_isolation_level()
+    backend = PostgresBackend(conn)
+    with backend._transaction() as transaction:
+        result = transaction.execute(text("SHOW transaction_isolation"))
         level = result.scalar()
+    assert conn.get_isolation_level() == original
     conn.close()
     assert level == "serializable"
 
@@ -366,6 +370,40 @@ def test_failed_shared_acquire_does_not_increment_fencing_token(
     token_after_reacquire = result2[0]
 
     assert token_after_reacquire == token_after_acquire + 1
+
+
+def test_shared_backend_has_independent_transactions(backend):
+    """
+    GIVEN: One Postgres backend shared by concurrent threads
+    WHEN: Independent locks are acquired and released
+    THEN: Connections are isolated and epochs persist between facade instances
+    """
+
+    def use_lock(number):
+        name = f"concurrent-{number}"
+        with Lock(name, backend=backend, ttl=5) as first:
+            assert first.epoch == 1
+        with Lock(name, backend=backend, ttl=5) as second:
+            assert second.epoch > first.epoch
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(use_lock, range(20)))
+
+
+def test_postgres_auto_renewal_uses_independent_connection(backend):
+    """
+    GIVEN: A Postgres backend with automatic renewal on a background thread
+    WHEN: The lock outlives its initial TTL
+    THEN: Renewal refreshes both backend ownership and local state
+    """
+    lock = Lock(
+        "renew-thread", backend=backend, ttl=0.5, auto_renewal=True, renewal_interval=0.1
+    )
+    with lock:
+        time.sleep(0.8)
+        assert lock.state == LockState.ACQUIRED
+        assert backend.get_owner("renew-thread") == lock.owner_id
+    assert backend.get_owner("renew-thread") is None
 
 
 if __name__ == "__main__":

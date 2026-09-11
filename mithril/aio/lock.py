@@ -4,8 +4,8 @@ Async distributed lock facade for Mithril.
 
 from __future__ import annotations
 
-import atexit
 import asyncio
+import atexit
 import base64
 import os
 import time
@@ -13,8 +13,25 @@ import traceback
 import weakref
 from typing import Any, Callable
 
-from .._types import LockConfig, LockMode, LockState, LockToken, Result
-from .._observability import LockEvent, LockHooks, get_hooks, get_logger, record_event
+from .._observability import (
+    LockEvent,
+    LockHooks,
+    get_hooks,
+    get_logger,
+    log_safely,
+    record_event,
+)
+from .._types import (
+    AcquisitionResult,
+    LockConfig,
+    LockMode,
+    LockState,
+    LockToken,
+    RenewalResult,
+    Result,
+    validate_backend,
+    validate_duration,
+)
 from ..exceptions import (
     AlreadyAcquiredError,
     ConfigurationError,
@@ -34,7 +51,7 @@ _ACTIVE_LOCKS: "weakref.WeakSet[AsyncLock]" = weakref.WeakSet()
 async def _release_held_locks() -> None:
     for lock in list(_ACTIVE_LOCKS):
         try:
-            if lock.state == LockState.ACQUIRED:
+            if lock.state in (LockState.ACQUIRED, LockState.EXPIRED):
                 await lock.release()
         except Exception:
             pass
@@ -95,6 +112,9 @@ class AsyncLock:
             debug=debug,
         )
         self._backend = backend
+        if strict:
+            validate_backend(backend, asynchronous=True)
+        self._operation_lock = asyncio.Lock()
         self._state = LockState.UNLOCKED
         self._owner_id: str | None = None
         self._token: LockToken | None = None
@@ -118,9 +138,34 @@ class AsyncLock:
         mode: LockMode | None = None,
     ) -> LockToken:
         """
+        Acquire once, rejecting concurrent use of the same instance.
+        """
+        if self._operation_lock.locked():
+            raise AlreadyAcquiredError("Another operation is in progress")
+        async with self._operation_lock:
+            try:
+                return await self._acquire(blocking, timeout, mode)
+            except BaseException:
+                if self._state == LockState.ACQUIRING:
+                    try:
+                        await _finish_cleanup(self._cleanup())
+                    finally:
+                        self._state = LockState.UNLOCKED
+                raise
+
+    async def _acquire(
+        self,
+        blocking: bool = True,
+        timeout: float | None = None,
+        mode: LockMode | None = None,
+    ) -> LockToken:
+        """
         Acquire the lock and return a LockToken.
         """
-        desired_mode = mode or self._config.mode
+        self._expire_if_needed()
+        desired_mode = self._config.mode if mode is None else mode
+        if not isinstance(desired_mode, LockMode):
+            raise ConfigurationError("mode must be a LockMode")
         if self._state == LockState.ACQUIRED:
             if self._reentrant and self._mode == desired_mode:
                 self._reentrant_count += 1
@@ -133,12 +178,14 @@ class AsyncLock:
             raise ConfigurationError("ttl must be set for acquisition")
 
         timeout_value = self._config.timeout if timeout is None else timeout
+        validate_duration(timeout_value, "timeout", allow_zero=True)
         if not blocking:
             timeout_value = 0
 
         self._owner_id = _generate_owner_id()
         lock_name = self._full_name()
-        self._epoch += 1
+        self._state = LockState.ACQUIRING
+        self._mode = desired_mode
 
         wait_func: Callable[[float], Any] | None = None
         if hasattr(self._backend, "wait_signal"):
@@ -154,13 +201,21 @@ class AsyncLock:
         )
         start = time.monotonic()
         async for _attempt in retry.attempts(wait_func=wait_func):
+            acquired_at = time.monotonic()
             result = await self._backend.acquire(
                 lock_name, self._owner_id, ttl, self._epoch, desired_mode
             )
             if result is not None:
-                token_value, epoch = result
-                acquired_at = time.monotonic()
                 expire_at = acquired_at + ttl
+                if isinstance(result, AcquisitionResult):
+                    token_value, epoch = result.fencing_token, result.epoch
+                    expire_at = min(expire_at, result.expire_at)
+                else:
+                    token_value, epoch = result
+                if time.monotonic() >= expire_at:
+                    await self._cleanup()
+                    self._state = LockState.EXPIRED
+                    raise LockTimeoutError("Lease expired before acquisition completed")
                 self._token = LockToken(
                     lock_name=lock_name,
                     owner_id=self._owner_id,
@@ -173,11 +228,18 @@ class AsyncLock:
                 self._mode = desired_mode
                 self._reentrant_count = 1
                 _ACTIVE_LOCKS.add(self)
-                await self._start_renewal()
+                try:
+                    await self._start_renewal()
+                except BaseException:
+                    await self._cleanup()
+                    self._state = LockState.EXPIRED
+                    raise
                 if self._config.debug:
                     self._acquire_stack = traceback.format_stack()
                 elapsed = time.monotonic() - start
-                self._logger.info(
+                log_safely(
+                    self._logger,
+                    "info",
                     "lock_acquired",
                     owner_id=self._owner_id,
                     fencing_token=token_value,
@@ -190,7 +252,9 @@ class AsyncLock:
                 return self._token
 
         elapsed = time.monotonic() - start
-        self._logger.warning(
+        log_safely(
+            self._logger,
+            "warning",
             "lock_timeout",
             owner_id=self._owner_id,
             mode=desired_mode.value,
@@ -203,32 +267,38 @@ class AsyncLock:
 
     async def release(self) -> None:
         """
+        Release ownership and stop renewal even when the caller is cancelled.
+        """
+        await _finish_cleanup(self._release_serialized())
+
+    async def _release_serialized(self) -> None:
+        async with self._operation_lock:
+            await self._release()
+
+    async def _release(self) -> None:
+        """
         Release the lock if owned by this instance.
         """
+        self._expire_if_needed()
         if self._state == LockState.EXPIRED:
+            await self._stop_renewal()
+            await self._cleanup()
+            _ACTIVE_LOCKS.discard(self)
             raise LockExpiredError("Lock already expired")
         if self._state != LockState.ACQUIRED:
             raise NotAcquiredError("Lock not acquired")
         if self._reentrant and self._reentrant_count > 1:
             self._reentrant_count -= 1
             return
-        if self._token and self._token.expire_at is not None:
-            if time.monotonic() > self._token.expire_at:
-                self._state = LockState.EXPIRED
-                await self._stop_renewal()
-                self._logger.warning(
-                    "lock_expired",
-                    owner_id=self._owner_id,
-                    mode=self._mode.value if self._mode else None,
-                )
-                self._emit_event("expired", ttl=self._config.ttl)
-                raise LockExpiredError("Lock expired before release")
-
+        await self._stop_renewal()
         result = await self._backend.release(
             self._full_name(), self._owner_id or "", self._mode
         )
         if not _release_succeeded(result):
-            self._logger.warning(
+            self._on_renewal_failed()
+            log_safely(
+                self._logger,
+                "warning",
                 "lock_release_failed",
                 owner_id=self._owner_id,
                 mode=self._mode.value if self._mode else None,
@@ -238,7 +308,9 @@ class AsyncLock:
         await self._stop_renewal()
         _ACTIVE_LOCKS.discard(self)
         self._reentrant_count = 0
-        self._logger.info(
+        log_safely(
+            self._logger,
+            "info",
             "lock_released",
             owner_id=self._owner_id,
             mode=self._mode.value if self._mode else None,
@@ -247,31 +319,57 @@ class AsyncLock:
 
     async def renew(self, ttl: float | None = None) -> None:
         """
+        Renew a live lease and refresh its conservative local deadline.
+        """
+        async with self._operation_lock:
+            await self._renew(ttl)
+
+    async def _renew(self, ttl: float | None = None) -> None:
+        """
         Manually renew the lock's TTL.
         """
+        self._expire_if_needed()
         if self._state == LockState.EXPIRED:
             raise LockExpiredError("Lock already expired")
         if self._state != LockState.ACQUIRED:
             raise NotAcquiredError("Lock not acquired")
 
-        if (ttl_value := self._config.ttl if ttl is None else ttl) is None or ttl_value <= 0:
+        if (ttl_value := self._config.ttl if ttl is None else ttl) is None:
             raise ConfigurationError("ttl must be > 0")
+        validate_duration(ttl_value, "ttl")
+        if self._renewal is not None and self._renewal._interval * 1.1 >= ttl_value:
+            raise ConfigurationError(
+                "ttl must exceed the auto-renewal interval including jitter"
+            )
 
-        result = await self._backend.renew(
-            self._full_name(), self._owner_id or "", ttl_value, self._mode
-        )
-        if not _renewal_succeeded(result):
+        started = time.monotonic()
+        try:
+            result = await self._backend.renew(
+                self._full_name(), self._owner_id or "", ttl_value, self._mode
+            )
+        except BaseException:
+            self._on_renewal_failed()
+            await self._stop_renewal()
+            raise
+        expire_at = started + ttl_value
+        if isinstance(result, RenewalResult):
+            expire_at = min(expire_at, result.expire_at)
+        if (
+            not _renewal_succeeded(result)
+            or time.monotonic() >= expire_at
+            or self._state != LockState.ACQUIRED
+        ):
             self._state = LockState.EXPIRED
-            self._logger.warning(
+            log_safely(
+                self._logger,
+                "warning",
                 "lock_expired",
                 owner_id=self._owner_id,
                 mode=self._mode.value if self._mode else None,
             )
             self._emit_event("expired", ttl=ttl_value)
+            await self._stop_renewal()
             raise RenewalFailedError("Renewal failed")
-
-        now = time.monotonic()
-        expire_at = now + ttl_value
         if self._token is not None:
             self._token = LockToken(
                 lock_name=self._token.lock_name,
@@ -281,7 +379,9 @@ class AsyncLock:
                 acquired_at=self._token.acquired_at,
                 expire_at=expire_at,
             )
-        self._logger.info(
+        log_safely(
+            self._logger,
+            "info",
             "lock_renewed",
             owner_id=self._owner_id,
             mode=self._mode.value if self._mode else None,
@@ -294,13 +394,14 @@ class AsyncLock:
         """
         Return the current lock token if held.
         """
-        return self._token
+        return self._token if self.state == LockState.ACQUIRED else None
 
     @property
     def state(self) -> LockState:
         """
         Return the current lock state.
         """
+        self._expire_if_needed()
         return self._state
 
     @property
@@ -315,7 +416,7 @@ class AsyncLock:
         """
         Return time remaining before expiry, if acquired and expiring.
         """
-        if self._state != LockState.ACQUIRED or (token := self._token) is None:
+        if self.state != LockState.ACQUIRED or (token := self._token) is None:
             return None
         if token.expire_at is None:
             return None
@@ -332,8 +433,12 @@ class AsyncLock:
         return await self.acquire()
 
     async def __aexit__(self, *exc_info) -> None:
-        if self._state == LockState.ACQUIRED:
-            await self.release()
+        if self.state in (LockState.ACQUIRED, LockState.EXPIRED):
+            try:
+                await self.release()
+            except Exception:
+                if not exc_info or exc_info[0] is None:
+                    raise
 
     def _full_name(self) -> str:
         if not self._config.namespace:
@@ -364,14 +469,39 @@ class AsyncLock:
         self._renewal = None
 
     def _on_renewal_failed(self) -> None:
+        if self._state != LockState.ACQUIRED:
+            return
         self._state = LockState.EXPIRED
         self._reentrant_count = 0
-        self._logger.warning(
+        log_safely(
+            self._logger,
+            "warning",
             "lock_expired",
             owner_id=self._owner_id,
             mode=self._mode.value if self._mode else None,
         )
         self._emit_event("expired", ttl=self._config.ttl)
+
+    def _expire_if_needed(self) -> None:
+        if (
+            self._state == LockState.ACQUIRED
+            and self._token is not None
+            and self._token.expire_at is not None
+            and time.monotonic() >= self._token.expire_at
+        ):
+            self._on_renewal_failed()
+
+    async def _renew_automatically(self, ttl: float) -> None:
+        await self.renew(ttl)
+
+    async def _cleanup(self) -> None:
+        if self._owner_id is not None:
+            try:
+                await self._backend.release(self._full_name(), self._owner_id, self._mode)
+            except Exception:
+                log_safely(
+                    self._logger, "exception", "lock_cleanup_failed", owner_id=self._owner_id
+                )
 
     def _emit_event(
         self,
@@ -401,6 +531,29 @@ class AsyncLock:
         )
 
 
+async def _finish_cleanup(coroutine):
+    """
+    Defer repeated caller cancellation until owner-checked cleanup finishes.
+    """
+    task = asyncio.create_task(coroutine)
+    cancellation = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            cancellation = exc
+        except Exception:
+            if cancellation is not None:
+                raise cancellation
+            raise
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 def _generate_owner_id() -> str:
     raw = os.urandom(18)
     return base64.b64encode(raw).decode("ascii")
@@ -410,8 +563,8 @@ def _release_succeeded(result: Result) -> bool:
     return result == Result.SUCCESS
 
 
-def _renewal_succeeded(result: Result) -> bool:
-    return result == Result.SUCCESS
+def _renewal_succeeded(result: Result | RenewalResult) -> bool:
+    return isinstance(result, RenewalResult) or result == Result.SUCCESS
 
 
 if __name__ == "__main__":

@@ -7,10 +7,12 @@ from __future__ import annotations
 from typing import Iterable
 
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import DBAPIError
 
 from ..._types import Result
-from .._postgres import PostgresQueries, _SERIALIZATION_FAILURE
+from ...aio._retry import AsyncRetryPolicy
+from ...exceptions import BackendTimeoutError
+from .._postgres import PostgresQueries, _is_transaction_conflict
 from ._database import AsyncDatabaseBackend
 
 __author__ = "Rohan B. Dalton"
@@ -22,25 +24,35 @@ class AsyncPostgresBackend(AsyncDatabaseBackend):
     """
 
     _QUERIES = PostgresQueries
+    _isolation_level = "SERIALIZABLE"
 
     async def initialize(self) -> None:
         """
         Set SERIALIZABLE isolation and create the schema tables.
         """
-        self._connection = await self._connection.execution_options(
-            isolation_level="SERIALIZABLE"
-        )
         await self._execute_many(self._QUERIES.SCHEMA)
 
-    @staticmethod
-    def _is_serialization_failure(exc: OperationalError) -> bool:
+    async def _fetchone(self, statement, params, transaction=None):
         """
-        Return True if the exception is a Postgres serialization failure.
+        Retry rolled-back release, renewal, and introspection transactions.
         """
-        if orig := exc.orig:
-            if code := getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None):
-                return code == _SERIALIZATION_FAILURE
-        return False
+        if transaction is not None or statement in (
+            self._QUERIES.ACQUIRE_EXCLUSIVE,
+            self._QUERIES.ACQUIRE_SHARED,
+        ):
+            return await super()._fetchone(statement, params, transaction)
+        retry = AsyncRetryPolicy(timeout=1, base_delay=0.001, max_delay=0.025, jitter=0.001)
+        failure = None
+        async for _ in retry.attempts():
+            try:
+                return await super()._fetchone(statement, params)
+            except DBAPIError as exc:
+                if not _is_transaction_conflict(exc):
+                    raise
+                failure = exc
+        raise BackendTimeoutError(
+            "Postgres transaction conflicts exceeded the retry budget"
+        ) from failure
 
     async def _do_acquire(self, query, params) -> tuple[int, int] | None:
         try:
@@ -48,8 +60,8 @@ class AsyncPostgresBackend(AsyncDatabaseBackend):
                 return int(row[0]), int(row[1])
             else:
                 return None
-        except OperationalError as exc:
-            if self._is_serialization_failure(exc):
+        except DBAPIError as exc:
+            if _is_transaction_conflict(exc):
                 return None
             raise
 
@@ -57,25 +69,21 @@ class AsyncPostgresBackend(AsyncDatabaseBackend):
         self, lock_name: str, owner_id: str, ttl_seconds: float, epoch: int
     ) -> tuple[int, int] | None:
         # asyncpg requires str for ``(:ttl_seconds || ' seconds')::interval``
-        # but int for ``epoch`` (INSERT into BIGINT column).
         params = {
             "lock_name": lock_name,
             "owner_id": owner_id,
             "ttl_seconds": str(ttl_seconds),
-            "epoch": epoch,
         }
         return await self._do_acquire(self._QUERIES.ACQUIRE_EXCLUSIVE, params)
 
     async def _acquire_shared(
         self, lock_name: str, owner_id: str, ttl_seconds: float, epoch: int
     ) -> tuple[int, int] | None:
-        # asyncpg requires str for both ``ttl_seconds`` and ``epoch`` here:
-        # ``epoch`` appears in a bare ``SELECT :epoch`` without column context.
+        # asyncpg infers a string parameter from the interval expression.
         params = {
             "lock_name": lock_name,
             "owner_id": owner_id,
             "ttl_seconds": str(ttl_seconds),
-            "epoch": str(epoch),
         }
         return await self._do_acquire(self._QUERIES.ACQUIRE_SHARED, params)
 
@@ -127,9 +135,9 @@ class AsyncPostgresBackend(AsyncDatabaseBackend):
         )
 
     async def _execute_many(self, statements: Iterable[str]) -> None:
-        async with self._connection.begin():
+        async with self._engine.begin() as connection:
             for statement in statements:
-                await self._connection.execute(text(statement))
+                await connection.execute(text(statement))
 
 
 if __name__ == "__main__":

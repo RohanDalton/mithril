@@ -3,20 +3,23 @@ import time
 import weakref
 
 from mithril._renewal import LockRenewer
+from mithril._types import LockMode, Result
 
 __author__ = "Rohan B. Dalton"
 
 
 class FakeBackend:
-    def __init__(self, results: list[bool]) -> None:
+    def __init__(self, results: list[Result]) -> None:
         self._results = results
         self.calls: int = 0
 
-    def renew(self, _key: str, _owner_id: str, _ttl: float) -> bool:
+    def renew(
+        self, _key: str, _owner_id: str, _ttl: float, _mode: LockMode = LockMode.EXCLUSIVE
+    ) -> Result:
         self.calls += 1
         if self._results:
             return self._results.pop(0)
-        return True
+        return Result.SUCCESS
 
 
 class FakeLock:
@@ -34,7 +37,7 @@ def test_renewal_failure_notifies_lock() -> None:
     THEN: The lock is notified of failure
     """
     lock = FakeLock()
-    backend = FakeBackend([False])
+    backend = FakeBackend([Result.WRONG_OWNER])
     renewer = LockRenewer(
         weakref.ref(lock),
         backend,
@@ -59,7 +62,7 @@ def test_renewal_stops_when_lock_is_collected() -> None:
     WHEN: The renewer wakes up
     THEN: It exits without further renewals
     """
-    backend = FakeBackend([True, True, True])
+    backend = FakeBackend([Result.SUCCESS, Result.SUCCESS, Result.SUCCESS])
     lock = FakeLock()
     renewer = LockRenewer(
         weakref.ref(lock),
@@ -88,7 +91,7 @@ def test_renewal_thread_is_daemon_and_stops_quickly() -> None:
     THEN: The thread is a daemon and returns promptly
     """
     lock = FakeLock()
-    backend = FakeBackend([True])
+    backend = FakeBackend([Result.SUCCESS])
     renewer = LockRenewer(
         weakref.ref(lock),
         backend,
@@ -117,7 +120,7 @@ def test_custom_on_renewal_failed_callback() -> None:
         callback_called.append(True)
 
     lock = FakeLock()
-    backend = FakeBackend([False])
+    backend = FakeBackend([Result.WRONG_OWNER])
     renewer = LockRenewer(
         weakref.ref(lock),
         backend,
@@ -141,7 +144,9 @@ def test_custom_on_renewal_failed_callback() -> None:
 class RaisingBackend:
     """Backend that raises on renew."""
 
-    def renew(self, _key: str, _owner_id: str, _ttl: float):
+    def renew(
+        self, _key: str, _owner_id: str, _ttl: float, _mode: LockMode = LockMode.EXCLUSIVE
+    ):
         raise RuntimeError("connection lost")
 
 

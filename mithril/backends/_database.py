@@ -1,12 +1,29 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import ClassVar
+from typing import Any, ClassVar, Iterable, Iterator
 
-from sqlalchemy import TextClause, text
+from sqlalchemy import Engine, TextClause, text
+from sqlalchemy.pool import SingletonThreadPool, StaticPool
 
-from .._types import LockMode, Result
+from .._types import LockMode, Result, validate_duration
+from ..exceptions import ConfigurationError
+from ._redis_common import validate_mode
 
 __author__ = "Rohan B. Dalton"
+
+
+def validate_database_pool(engine: Engine) -> None:
+    """
+    Reject pools that cannot supply independent SQLite transactions safely.
+    """
+    if engine.dialect.name == "sqlite" and isinstance(
+        engine.pool, (StaticPool, SingletonThreadPool)
+    ):
+        raise ConfigurationError(
+            "SQLite locks require a file-backed database with an independent-connection pool"
+        )
 
 
 class DatabaseQueries:
@@ -23,9 +40,12 @@ class DatabaseQueries:
 
 class DatabaseBackend(ABC):
     _QUERIES: ClassVar[DatabaseQueries] = DatabaseQueries
+    _isolation_level: str | None = None
 
     def __init__(self, connection: Any) -> None:
         self._connection = connection
+        self._engine = connection if isinstance(connection, Engine) else connection.engine
+        validate_database_pool(self._engine)
         self._ensure_schema()
 
     @abstractmethod
@@ -61,15 +81,15 @@ class DatabaseBackend(ABC):
         lock_name: str,
         owner_id: str,
         ttl_seconds: float,
-        epoch: int,
+        epoch: int = 0,
         mode: LockMode = LockMode.EXCLUSIVE,
     ) -> tuple[int, int] | None:
         """
         Acquire the lock and return (fencing_token, epoch) on success.
         """
+        validate_mode(mode)
+        validate_duration(ttl_seconds, "ttl_seconds")
         if mode == LockMode.EXCLUSIVE:
-            if ttl_seconds <= 0:
-                raise ValueError("ttl_seconds must be > 0")
             return self._acquire_exclusive(
                 lock_name=lock_name, owner_id=owner_id, ttl_seconds=ttl_seconds, epoch=epoch
             )
@@ -108,6 +128,7 @@ class DatabaseBackend(ABC):
         """
         Release the lock, returning Result.SUCCESS on success.
         """
+        validate_mode(mode)
         if mode == LockMode.EXCLUSIVE:
             return self._release_exclusive(lock_name=lock_name, owner_id=owner_id)
         else:
@@ -120,8 +141,8 @@ class DatabaseBackend(ABC):
         ttl_seconds: float,
         mode: LockMode = LockMode.EXCLUSIVE,
     ) -> Result:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be > 0")
+        validate_mode(mode)
+        validate_duration(ttl_seconds, "ttl_seconds")
 
         if mode == LockMode.EXCLUSIVE:
             return self._renew_exclusive(
@@ -136,9 +157,9 @@ class DatabaseBackend(ABC):
         self._execute_many(self._QUERIES.SCHEMA)
 
     def _execute_many(self, statements: Iterable[str]) -> None:
-        with self._connection.begin():
+        with self._engine.begin() as connection:
             for statement in statements:
-                self._connection.execute(text(statement))
+                connection.execute(text(statement))
 
     def _fetchone(
         self,
@@ -147,16 +168,23 @@ class DatabaseBackend(ABC):
         transaction: Any | None = None,
     ) -> tuple[Any, ...] | None:
         if transaction is None:
-            with self._connection.begin():
-                result = self._connection.execute(statement, params)
+            with self._transaction() as connection:
+                result = connection.execute(statement, params)
                 return result.fetchone()
         result = transaction.execute(statement, params)
         return result.fetchone()
 
     @contextmanager
     def _transaction(self) -> Iterator[Any]:
-        with self._connection.begin():
-            yield self._connection
+        with self._engine.connect() as connection:
+            if self._isolation_level:
+                connection = connection.execution_options(
+                    isolation_level=self._isolation_level
+                )
+            with connection.begin():
+                if connection.dialect.name == "sqlite":
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
+                yield connection
 
 
 if __name__ == "__main__":

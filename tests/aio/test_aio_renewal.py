@@ -3,21 +3,24 @@ import weakref
 
 import pytest
 
+from mithril._types import LockMode, Result
 from mithril.aio._renewal import AsyncLockRenewer
 
 __author__ = "Rohan B. Dalton"
 
 
 class AsyncFakeBackend:
-    def __init__(self, results: list[bool]) -> None:
+    def __init__(self, results: list[Result]) -> None:
         self._results = results
         self.calls: int = 0
 
-    async def renew(self, _key: str, _owner_id: str, _ttl: float) -> bool:
+    async def renew(
+        self, _key: str, _owner_id: str, _ttl: float, _mode: LockMode = LockMode.EXCLUSIVE
+    ) -> Result:
         self.calls += 1
         if self._results:
             return self._results.pop(0)
-        return True
+        return Result.SUCCESS
 
 
 class AsyncFakeLock:
@@ -37,7 +40,7 @@ async def test_async_renewal_failure_notifies_lock() -> None:
     """
 
     lock = AsyncFakeLock()
-    backend = AsyncFakeBackend([False])
+    backend = AsyncFakeBackend([Result.WRONG_OWNER])
     renewer = AsyncLockRenewer(
         weakref.ref(lock),
         backend,
@@ -65,7 +68,7 @@ async def test_async_renewal_stop_cancels_task() -> None:
     """
 
     lock = AsyncFakeLock()
-    backend = AsyncFakeBackend([True, True])
+    backend = AsyncFakeBackend([Result.SUCCESS, Result.SUCCESS])
     renewer = AsyncLockRenewer(
         weakref.ref(lock),
         backend,
@@ -82,7 +85,9 @@ async def test_async_renewal_stop_cancels_task() -> None:
 class AsyncRaisingBackend:
     """Backend that raises on renew."""
 
-    async def renew(self, _key: str, _owner_id: str, _ttl: float):
+    async def renew(
+        self, _key: str, _owner_id: str, _ttl: float, _mode: LockMode = LockMode.EXCLUSIVE
+    ):
         raise RuntimeError("connection lost")
 
 

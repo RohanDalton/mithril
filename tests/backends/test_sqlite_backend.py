@@ -1,10 +1,13 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Connection
 
 from mithril._types import LockMode, Result
-from mithril.backends._sqlite import SQLiteBackend
+from mithril.backends._sqlite import _SYNC_FENCING_SQL, SQLiteBackend
+from mithril.exceptions import ConfigurationError
 
 __author__ = "Rohan B. Dalton"
 
@@ -261,6 +264,59 @@ def test_failed_shared_acquire_does_not_increment_fencing_token(
     token_after_reacquire = result2[0]
 
     assert token_after_reacquire == token_after_acquire + 1
+
+
+def test_failed_fencing_update_rolls_back_acquisition(backend, monkeypatch):
+    """
+    GIVEN: A failure after the lease insert but before fencing synchronization
+    WHEN: The acquisition transaction rolls back
+    THEN: Neither ownership nor the fencing counter is committed
+    """
+    execute = Connection.execute
+
+    def fail_fencing(connection, statement, *args, **kwargs):
+        if statement is _SYNC_FENCING_SQL:
+            raise RuntimeError("fencing failed")
+        return execute(connection, statement, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Connection, "execute", fail_fencing)
+        with pytest.raises(RuntimeError, match="fencing failed"):
+            backend.acquire("lock", "first", 5)
+    assert backend.get_owner("lock") is None
+    assert backend.acquire("lock", "second", 5) == (1, 1)
+
+
+def test_shared_backend_supports_concurrent_connections(backend):
+    """
+    GIVEN: One database backend shared by multiple threads
+    WHEN: Independent locks are acquired and released concurrently
+    THEN: Each operation has its own transaction and fencing advances per name
+    """
+
+    def acquire_and_release(number):
+        name = f"lock-{number}"
+        assert backend.acquire(name, "first", 5) == (1, 1)
+        assert backend.release(name, "first") == Result.SUCCESS
+        assert backend.acquire(name, "second", 5) == (2, 2)
+        assert backend.release(name, "second") == Result.SUCCESS
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(acquire_and_release, range(20)))
+
+
+def test_unsafe_in_memory_pool_is_rejected():
+    """
+    GIVEN: An in-memory SQLite engine with thread-local connections
+    WHEN: A database backend is constructed
+    THEN: Configuration fails instead of silently using different lock databases
+    """
+    engine = create_engine("sqlite://")
+    try:
+        with pytest.raises(ConfigurationError, match="independent-connection"):
+            SQLiteBackend(engine)
+    finally:
+        engine.dispose()
 
 
 if __name__ == "__main__":

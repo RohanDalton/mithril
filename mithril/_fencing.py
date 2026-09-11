@@ -4,11 +4,13 @@ Fencing token providers for Mithril.
 
 from __future__ import annotations
 
-import os
 import threading
-from typing import Any
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
+from urllib.parse import quote
+
+from ._file_io import file_mutex, read_file, replace_file, validate_component
+from .exceptions import FencingTokenError
 
 __author__ = "Rohan B. Dalton"
 
@@ -46,88 +48,38 @@ class InMemoryFencingTokenProvider:
 
 class FileFencingTokenProvider:
     """
-    File-backed fencing token provider.
+    Durable counters protected by a separate OS mutex and atomic replacement.
     """
 
     def __init__(self, directory: str | Path, namespace: str = "mithril") -> None:
+        validate_component(namespace)
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
         self._namespace = namespace
 
     def next_token(self, lock_name: str) -> int:
         path = self._path_for(lock_name)
-        path.touch(exist_ok=True)
-        with path.open("r+", encoding="ascii") as fh:
-            self._lock_file(fh)
-            try:
-                current = self._read_counter(fh)
-                next_value = current + 1
-                self._write_counter(fh, next_value)
-                return next_value
-            finally:
-                self._unlock_file(fh)
+        with file_mutex(path.with_suffix(".fence.guard")):
+            current = self._read_counter(path)
+            replace_file(path, str(value := current + 1))
+            return value
 
     def current_token(self, lock_name: str) -> int:
-        if not (path := self._path_for(lock_name)).exists():
-            return 0
-        with path.open("r+", encoding="ascii") as fh:
-            self._lock_file(fh)
-            try:
-                return self._read_counter(fh)
-            finally:
-                self._unlock_file(fh)
+        path = self._path_for(lock_name)
+        with file_mutex(path.with_suffix(".fence.guard")):
+            return self._read_counter(path)
 
     def _path_for(self, lock_name: str) -> Path:
-        if os.sep in lock_name or (os.altsep and os.altsep in lock_name):
-            raise ValueError("lock_name must not contain path separators")
-        filename = f"{self._namespace}.{lock_name}.fence"
-        return self._directory / filename
+        validate_component(lock_name)
+        return self._directory / f"{self._namespace}.{lock_name}.fence"
 
     @staticmethod
-    def _read_counter(handle) -> int:
-        handle.seek(0)
-        if not (data := handle.read().strip()):
+    def _read_counter(path: Path) -> int:
+        if (data := read_file(path)) is None:
             return 0
-        try:
-            return int(data, 10)
-        except ValueError:
-            return 0
-
-    @staticmethod
-    def _write_counter(handle, value: int) -> None:
-        handle.seek(0)
-        handle.write(str(value))
-        handle.truncate()
-        handle.flush()
-        os.fsync(handle.fileno())
-
-    @staticmethod
-    def _lock_file(handle) -> None:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write("0")
-                handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-
-    @staticmethod
-    def _unlock_file(handle) -> None:
-        if os.name == "nt":
-            import msvcrt
-
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if not data.isascii() or not data.isdecimal():
+            raise FencingTokenError(f"Invalid fencing counter: {path}")
+        return int(data)
 
 
 class FencingGuard:
@@ -140,6 +92,35 @@ class FencingGuard:
         Validate a fencing token and update the stored max.
         """
         raise NotImplementedError("Provide a backend-specific implementation")
+
+
+class RedisFencingTokenProvider:
+    """
+    Explicit fencing authority with persistent counters on one Redis service.
+
+    The service must preserve its counters across failures. Configure bounded
+    client timeouts; availability of this authority is required by Redlock.
+    """
+
+    _SCRIPT = """
+    redis.call('INCR', KEYS[1])
+    redis.call('PERSIST', KEYS[1])
+    return redis.call('GET', KEYS[1])
+    """
+
+    def __init__(self, client: Any, *, namespace: str = "mithril") -> None:
+        self._client = client
+        self._namespace = namespace
+        self._script = client.register_script(self._SCRIPT)
+
+    def _key(self, lock_name: str) -> str:
+        return f"{quote(self._namespace, safe='')}:authority:{quote(lock_name, safe='')}"
+
+    def next_token(self, lock_name: str) -> int:
+        return int(self._script(keys=[self._key(lock_name)]))
+
+    def current_token(self, lock_name: str) -> int:
+        return int(self._client.get(self._key(lock_name)) or 0)
 
 
 class RedisFencingGuard(FencingGuard):

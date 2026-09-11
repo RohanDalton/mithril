@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 from abc import abstractmethod
 from contextlib import asynccontextmanager
 from typing import Any, Iterator
 
-from .._database import DatabaseBackend
+from sqlalchemy.ext.asyncio import AsyncEngine
+
 from ... import LockMode
-from ..._types import Result
+from ..._types import Result, validate_duration
+from .._database import DatabaseBackend, validate_database_pool
+from .._redis_common import validate_mode
 
 __author__ = "Rohan B. Dalton"
 
@@ -14,6 +19,8 @@ class AsyncDatabaseBackend(DatabaseBackend):
         # Skip the sync _ensure_schema() call from DatabaseBackend.__init__.
         # Callers must use ``await backend.initialize()`` instead.
         self._connection = connection
+        self._engine = connection if isinstance(connection, AsyncEngine) else connection.engine
+        validate_database_pool(self._engine.sync_engine)
 
     async def initialize(self) -> None:
         """
@@ -56,15 +63,15 @@ class AsyncDatabaseBackend(DatabaseBackend):
         lock_name: str,
         owner_id: str,
         ttl_seconds: float,
-        epoch: int,
+        epoch: int = 0,
         mode: LockMode = LockMode.EXCLUSIVE,
     ) -> tuple[int, int] | None:
         """
         Acquire the lock and return (fencing_token, epoch) on success.
         """
+        validate_mode(mode)
+        validate_duration(ttl_seconds, "ttl_seconds")
         if mode == LockMode.EXCLUSIVE:
-            if ttl_seconds <= 0:
-                raise ValueError("ttl_seconds must be > 0")
             return await self._acquire_exclusive(
                 lock_name=lock_name, owner_id=owner_id, ttl_seconds=ttl_seconds, epoch=epoch
             )
@@ -103,6 +110,7 @@ class AsyncDatabaseBackend(DatabaseBackend):
         """
         Release the lock, returning Result.SUCCESS on success.
         """
+        validate_mode(mode)
         if mode == LockMode.EXCLUSIVE:
             return await self._release_exclusive(lock_name=lock_name, owner_id=owner_id)
         else:
@@ -115,8 +123,8 @@ class AsyncDatabaseBackend(DatabaseBackend):
         ttl_seconds: float,
         mode: LockMode = LockMode.EXCLUSIVE,
     ) -> Result:
-        if ttl_seconds <= 0:
-            raise ValueError("ttl_seconds must be > 0")
+        validate_mode(mode)
+        validate_duration(ttl_seconds, "ttl_seconds")
 
         if mode == LockMode.EXCLUSIVE:
             return await self._renew_exclusive(
@@ -134,16 +142,23 @@ class AsyncDatabaseBackend(DatabaseBackend):
         transaction: Any | None = None,
     ) -> tuple[Any, ...] | None:
         if transaction is None:
-            async with self._connection.begin():
-                result = await self._connection.execute(statement, params)
+            async with self._transaction() as connection:
+                result = await connection.execute(statement, params)
                 return result.fetchone()
         result = await transaction.execute(statement, params)
         return result.fetchone()
 
     @asynccontextmanager
     async def _transaction(self) -> Iterator[Any]:
-        async with self._connection.begin():
-            yield self._connection
+        async with self._engine.connect() as connection:
+            if self._isolation_level:
+                connection = await connection.execution_options(
+                    isolation_level=self._isolation_level
+                )
+            async with connection.begin():
+                if connection.dialect.name == "sqlite":
+                    await connection.exec_driver_sql("BEGIN IMMEDIATE")
+                yield connection
 
 
 if __name__ == "__main__":

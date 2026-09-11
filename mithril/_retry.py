@@ -9,6 +9,8 @@ import random
 import time
 from typing import Callable, Iterator
 
+from ._types import validate_duration
+
 __author__ = "Rohan B. Dalton"
 
 
@@ -37,14 +39,10 @@ class RetryPolicy:
         jitter: float,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if timeout < 0:
-            raise ValueError("timeout must be >= 0")
-        if base_delay <= 0:
-            raise ValueError("base_delay must be > 0")
-        if max_delay <= 0:
-            raise ValueError("max_delay must be > 0")
-        if jitter < 0:
-            raise ValueError("jitter must be >= 0")
+        validate_duration(timeout, "timeout", allow_zero=True)
+        validate_duration(base_delay, "base_delay")
+        validate_duration(max_delay, "max_delay")
+        validate_duration(jitter, "jitter", allow_zero=True)
         self._timeout = timeout
         self._base_delay = base_delay
         self._max_delay = max_delay
@@ -62,11 +60,12 @@ class RetryPolicy:
         start = self._clock()
         attempt = 0
         delay = 0.0
+        backoff = min(self._base_delay, self._max_delay)
         while True:
             now = self._clock()
             elapsed = now - start
-            remaining = self._timeout - elapsed
-            if remaining < 0:
+            remaining = max(0.0, self._timeout - elapsed)
+            if attempt and remaining <= 0:
                 break
 
             attempt += 1
@@ -77,13 +76,11 @@ class RetryPolicy:
                 delay=delay,
             )
 
-            if remaining <= 0:
+            if (remaining := self._timeout - (self._clock() - start)) <= 0:
                 break
 
-            backoff = self._base_delay * (2 ** (attempt - 1))
-            delay = min(self._max_delay, backoff) + random.uniform(0, self._jitter)
-            if delay > remaining:
-                delay = remaining
+            delay = min(self._max_delay, backoff + random.uniform(0, self._jitter), remaining)
+            backoff = min(self._max_delay, backoff * 2)
             if delay <= 0:
                 continue
             if wait_func is None:

@@ -4,13 +4,10 @@ SQLite backend for Mithril.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
-
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from .._types import LockMode, Result
-from ..exceptions import ConfigurationError
+from .._types import Result
 from ._database import DatabaseBackend
 
 __author__ = "Rohan B. Dalton"
@@ -44,7 +41,8 @@ WITH now(now_ts) AS (SELECT {_NOW_EXPR})
 INSERT INTO mithril_locks(name, owner, fencing_token, epoch, acquired_at, expire_at)
 SELECT :lock_name, :owner_id,
        COALESCE((SELECT token FROM mithril_fencing WHERE name = :lock_name), 0) + 1,
-       :epoch, now.now_ts, now.now_ts + :ttl_seconds
+       COALESCE((SELECT token FROM mithril_fencing WHERE name = :lock_name), 0) + 1,
+       now.now_ts, now.now_ts + :ttl_seconds
 FROM now
 WHERE NOT EXISTS (
     SELECT 1 FROM mithril_locks
@@ -184,7 +182,7 @@ class SQLiteBackend(DatabaseBackend):
     _QUERIES = SQLiteQueries
 
     def _acquire_exclusive(
-        self, lock_name: str, owner_id: int, ttl_seconds: float, epoch: int
+        self, lock_name: str, owner_id: str, ttl_seconds: float, epoch: int
     ) -> tuple[int, int] | None:
         try:
             with self._transaction() as transaction:
@@ -230,7 +228,7 @@ class SQLiteBackend(DatabaseBackend):
                     query = _INCREMENT_FENCING_SQL
                     params = {"lock_name": lock_name}
                     row = self._fetchone(query, params, transaction)
-                    return int(row[0]), epoch
+                    return int(row[0]), int(row[0])
                 else:
                     return None
         except OperationalError as exc:

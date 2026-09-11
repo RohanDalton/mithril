@@ -4,14 +4,14 @@ Async SQLite backend for Mithril.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Iterable
 
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from ..._types import Result
+from .._sqlite import _INCREMENT_FENCING_SQL, _SYNC_FENCING_SQL, SQLiteQueries, _is_busy
 from ._database import AsyncDatabaseBackend
-from .._sqlite import SQLiteQueries, _SYNC_FENCING_SQL, _INCREMENT_FENCING_SQL, _is_busy
 
 __author__ = "Rohan B. Dalton"
 
@@ -70,7 +70,7 @@ class AsyncSQLiteBackend(AsyncDatabaseBackend):
                     query = _INCREMENT_FENCING_SQL
                     params = {"lock_name": lock_name}
                     row = await self._fetchone(query, params, transaction)
-                    return int(row[0]), epoch
+                    return int(row[0]), int(row[0])
                 else:
                     return None
         except OperationalError as exc:
@@ -150,9 +150,9 @@ class AsyncSQLiteBackend(AsyncDatabaseBackend):
                     return Result.NOT_FOUND
 
     async def _execute_many(self, statements: Iterable[str]) -> None:
-        async with self._connection.begin():
+        async with self._engine.begin() as connection:
             for statement in statements:
-                await self._connection.execute(text(statement))
+                await connection.execute(text(statement))
 
 
 if __name__ == "__main__":

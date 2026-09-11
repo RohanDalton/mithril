@@ -2,10 +2,12 @@ import asyncio
 
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from mithril._types import LockMode, Result
+from mithril.backends._sqlite import _SYNC_FENCING_SQL
 from mithril.backends.aio._sqlite import AsyncSQLiteBackend
+from mithril.exceptions import ConfigurationError
 
 __author__ = "Rohan B. Dalton"
 
@@ -306,6 +308,58 @@ async def test_release_requires_owner(backend: AsyncSQLiteBackend) -> None:
     assert await backend.acquire("lock", "owner", ttl_seconds=5.0, epoch=1) is not None
     assert await backend.release("lock", "other") == Result.WRONG_OWNER
     assert await backend.release("lock", "owner") == Result.SUCCESS
+
+
+async def test_failed_fencing_update_rolls_back_acquisition(backend, monkeypatch):
+    """
+    GIVEN: A failure after inserting an async SQLite lease
+    WHEN: Fencing synchronization fails
+    THEN: The entire acquisition rolls back rather than leaving a committed lease
+    """
+    execute = AsyncConnection.execute
+
+    async def fail_fencing(connection, statement, *args, **kwargs):
+        if statement is _SYNC_FENCING_SQL:
+            raise RuntimeError("fencing failed")
+        return await execute(connection, statement, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AsyncConnection, "execute", fail_fencing)
+        with pytest.raises(RuntimeError, match="fencing failed"):
+            await backend.acquire("lock", "first", 5)
+    assert await backend.get_owner("lock") is None
+    assert await backend.acquire("lock", "second", 5) == (1, 1)
+
+
+async def test_shared_backend_supports_concurrent_connections(backend):
+    """
+    GIVEN: One async database backend shared by concurrent tasks
+    WHEN: Independent locks are acquired and released concurrently
+    THEN: Each operation has an independent transaction and increasing epochs
+    """
+
+    async def acquire_and_release(number):
+        name = f"lock-{number}"
+        assert await backend.acquire(name, "first", 5) == (1, 1)
+        assert await backend.release(name, "first") == Result.SUCCESS
+        assert await backend.acquire(name, "second", 5) == (2, 2)
+        assert await backend.release(name, "second") == Result.SUCCESS
+
+    await asyncio.gather(*(acquire_and_release(number) for number in range(20)))
+
+
+async def test_unsafe_shared_connection_pool_is_rejected():
+    """
+    GIVEN: An async in-memory SQLite engine sharing one physical connection
+    WHEN: A database backend is constructed
+    THEN: Configuration fails instead of allowing overlapping transactions
+    """
+    engine = create_async_engine("sqlite+aiosqlite://")
+    try:
+        with pytest.raises(ConfigurationError, match="independent-connection"):
+            AsyncSQLiteBackend(engine)
+    finally:
+        await engine.dispose()
 
 
 if __name__ == "__main__":

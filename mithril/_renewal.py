@@ -11,6 +11,7 @@ from typing import Callable
 
 import structlog
 
+from ._observability import log_safely
 from ._types import LockBackend, LockMode, Result
 
 __author__ = "Rohan B. Dalton"
@@ -62,9 +63,13 @@ class LockRenewer:
         Stop the renewal thread and wait for shutdown.
         """
         self._stop_event.set()
+        if threading.current_thread() is self._thread:
+            return
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
-            _LOGGER.warning(
+            log_safely(
+                _LOGGER,
+                "warning",
                 "Renewal thread for %s did not stop within %ss",
                 self._key,
                 timeout,
@@ -75,12 +80,15 @@ class LockRenewer:
             if (lock := self._lock_ref()) is None:
                 break
             try:
+                if renew := getattr(lock, "_renew_automatically", None):
+                    renew(self._ttl)
+                    continue
                 result = self._backend.renew(self._key, self._owner_id, self._ttl, self._mode)
                 if not _renewal_succeeded(result):
                     self._notify_failure(lock)
                     break
             except Exception:
-                _LOGGER.exception("Renewal failed for %s", self._key)
+                log_safely(_LOGGER, "exception", "Renewal failed for %s", self._key)
                 self._notify_failure(lock)
                 break
             finally:
@@ -90,7 +98,7 @@ class LockRenewer:
         base = self._interval
         jitter = base * self._jitter_fraction
         value = base + random.uniform(-jitter, jitter)
-        return max(0.01, value)
+        return max(self._interval * 0.1, value)
 
     def _notify_failure(self, lock) -> None:
         if self._on_renewal_failed is not None:

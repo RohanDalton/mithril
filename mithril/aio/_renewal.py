@@ -11,6 +11,7 @@ from typing import Awaitable, Callable
 
 import structlog
 
+from .._observability import log_safely
 from .._types import LockBackend, LockMode, Result
 
 __author__ = "Rohan B. Dalton"
@@ -58,7 +59,11 @@ class AsyncLockRenewer:
         Cancel the renewal task and wait for completion.
         """
         if self._task:
-            self._task.cancel()
+            if asyncio.current_task() is self._task:
+                return
+            else:
+                self._task.cancel()
+
             try:
                 await self._task
             except asyncio.CancelledError:
@@ -74,14 +79,19 @@ class AsyncLockRenewer:
                 await asyncio.sleep(self._interval_with_jitter())
                 if lock := self._lock_ref():
                     try:
+                        if renew := getattr(lock, "_renew_automatically", None):
+                            await renew(self._ttl)
+                            continue
                         result = await self._backend.renew(
                             self._key, self._owner_id, self._ttl, self._mode
                         )
-                        if not _renewal_succeeded(result):
+                        if not self._renewal_succeeded(result):
                             await self._notify_failure(lock)
                             break
                     except Exception:
-                        _LOGGER.exception("Async renewal failed for %s", self._key)
+                        log_safely(
+                            _LOGGER, "exception", "Async renewal failed for %s", self._key
+                        )
                         await self._notify_failure(lock)
                         break
                     finally:
@@ -95,19 +105,20 @@ class AsyncLockRenewer:
         base = self._interval
         jitter = base * self._jitter_fraction
         value = base + random.uniform(-jitter, jitter)
-        return max(0.01, value)
+        return max(self._interval * 0.1, value)
 
     async def _notify_failure(self, lock) -> None:
         if self._on_renewal_failed is not None:
             await self._on_renewal_failed()
         else:
+            # noinspection PyProtectedMember
             result = lock._on_renewal_failed()
             if asyncio.iscoroutine(result):
                 await result
 
-
-def _renewal_succeeded(result: Result) -> bool:
-    return result == Result.SUCCESS
+    @staticmethod
+    def _renewal_succeeded(result: Result) -> bool:
+        return result == Result.SUCCESS
 
 
 if __name__ == "__main__":
