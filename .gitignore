@@ -3,6 +3,9 @@ __pycache__/**
 
 coverage
 docs/build
+dist/
+build/
+*.egg-info/
 
 .idea
 

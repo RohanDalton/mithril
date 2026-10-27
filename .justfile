@@ -1,4 +1,5 @@
 run := "pixi run -e dev"
+build_run := "pixi run -e build"
 
 [doc("Automatically format files")]
 format *args=".":
@@ -17,3 +18,13 @@ test *args="tests":
 [doc("Typecheck the code")]
 typecheck *args=".":
     {{ run }} ty check {{ args }}
+
+[doc("Build the wheel and source distribution")]
+build:
+    {{ build_run }} python -m build
+    {{ build_run }} python -m twine check --strict dist/*
+
+[doc("Upload built distributions to PyPI")]
+publish:
+    {{ build_run }} python -m twine check --strict dist/*
+    {{ build_run }} python -m twine upload dist/*
