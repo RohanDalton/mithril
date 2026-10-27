@@ -13,7 +13,11 @@ release = run_path(str(Path(__file__).resolve().parents[2] / "mithril" / "__vers
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-extensions = []
+extensions = ["sphinx.ext.autodoc"]
+
+# Keep the reference readable; lifecycle and type semantics are explained in
+# api.rst rather than generating links for every dependency's annotation.
+autodoc_typehints = "none"
 
 templates_path = ["_templates"]
 exclude_patterns = []
